@@ -2,32 +2,26 @@
 SonarQube Ephemeral Infrastructure - AWS Account Agnostic
 Pulumi IaC with GitOps, auto-scheduling, and cost optimization.
 
-Supports: AWS (ECS Fargate Spot + EFS + RDS Aurora Serverless v2)
-Strategy: Ephemeral containers, data persistence via EFS/RDS, auto start/stop
+Supports: AWS ECS Fargate Spot + EFS (no RDS — SCP-safe)
+Strategy: PostgreSQL runs as a sidecar container, all data on EFS.
+          Ephemeral containers, persistent data, auto start/stop.
 """
 
 import pulumi
 import pulumi_aws as aws
 import json
-from datetime import datetime
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
 cfg = pulumi.Config()
-env          = cfg.get("env")           or "dev"
-project      = cfg.get("project")       or "sonarqube"
-region       = cfg.get("region")        or "us-east-1"
-# Working hours (UTC) — adjust per your timezone
-work_start   = cfg.get_int("workStartHourUTC") or 7   # 7 AM UTC
-work_end     = cfg.get_int("workEndHourUTC")   or 19  # 7 PM UTC
+env          = cfg.get("env")                or "dev"
+project      = cfg.get("project")            or "sonarqube"
+region       = cfg.get("region")             or "us-east-1"
+work_start   = cfg.get_int("workStartHourUTC") or 7    # 7 AM UTC
+work_end     = cfg.get_int("workEndHourUTC")   or 19   # 7 PM UTC
 work_days    = cfg.get("workDays")             or "MON-FRI"
-# Compute tier: "spot" (cheapest) | "on-demand"
-compute_tier = cfg.get("computeTier")          or "spot"
-# SonarQube edition: "community" (free) | "developer" | "enterprise"
-sq_edition   = cfg.get("sonarEdition")         or "community"
-# DB: "aurora-serverless" (cheapest) | "rds-postgres"
-db_type      = cfg.get("dbType")               or "aurora-serverless"
+db_password  = cfg.require_secret("dbPassword")
 
 tags = {
     "Project":     project,
@@ -54,8 +48,7 @@ igw = aws.ec2.InternetGateway(
     tags   = {**tags, "Name": f"{project}-{env}-igw"},
 )
 
-# Public subnets (2 AZs for HA ALB)
-public_subnets = []
+public_subnets  = []
 private_subnets = []
 azs = ["a", "b"]
 
@@ -78,7 +71,6 @@ for i, az in enumerate(azs):
     public_subnets.append(pub)
     private_subnets.append(priv)
 
-# NAT Gateway (single AZ for cost savings in dev)
 eip = aws.ec2.Eip(f"{project}-nat-eip", domain="vpc", tags=tags)
 nat_gw = aws.ec2.NatGateway(
     f"{project}-nat",
@@ -87,7 +79,6 @@ nat_gw = aws.ec2.NatGateway(
     tags          = {**tags, "Name": f"{project}-nat"},
 )
 
-# Route tables
 pub_rt = aws.ec2.RouteTable(
     f"{project}-pub-rt",
     vpc_id = vpc.id,
@@ -102,7 +93,7 @@ priv_rt = aws.ec2.RouteTable(
 )
 
 for i, (pub, priv) in enumerate(zip(public_subnets, private_subnets)):
-    aws.ec2.RouteTableAssociation(f"{project}-pub-rta-{i}", subnet_id=pub.id, route_table_id=pub_rt.id)
+    aws.ec2.RouteTableAssociation(f"{project}-pub-rta-{i}",  subnet_id=pub.id,  route_table_id=pub_rt.id)
     aws.ec2.RouteTableAssociation(f"{project}-priv-rta-{i}", subnet_id=priv.id, route_table_id=priv_rt.id)
 
 # ─────────────────────────────────────────────
@@ -111,13 +102,13 @@ for i, (pub, priv) in enumerate(zip(public_subnets, private_subnets)):
 alb_sg = aws.ec2.SecurityGroup(
     f"{project}-alb-sg",
     vpc_id      = vpc.id,
-    description = "ALB inbound HTTP/HTTPS",
+    description = "ALB inbound HTTP",
     ingress     = [
         {"from_port": 80,  "to_port": 80,  "protocol": "tcp", "cidr_blocks": ["0.0.0.0/0"]},
         {"from_port": 443, "to_port": 443, "protocol": "tcp", "cidr_blocks": ["0.0.0.0/0"]},
     ],
-    egress      = [{"from_port": 0, "to_port": 0, "protocol": "-1", "cidr_blocks": ["0.0.0.0/0"]}],
-    tags        = {**tags, "Name": f"{project}-alb-sg"},
+    egress = [{"from_port": 0, "to_port": 0, "protocol": "-1", "cidr_blocks": ["0.0.0.0/0"]}],
+    tags   = {**tags, "Name": f"{project}-alb-sg"},
 )
 
 ecs_sg = aws.ec2.SecurityGroup(
@@ -129,26 +120,17 @@ ecs_sg = aws.ec2.SecurityGroup(
     tags        = {**tags, "Name": f"{project}-ecs-sg"},
 )
 
-db_sg = aws.ec2.SecurityGroup(
-    f"{project}-db-sg",
-    vpc_id      = vpc.id,
-    description = "SonarQube DB",
-    ingress     = [{"from_port": 5432, "to_port": 5432, "protocol": "tcp", "security_groups": [ecs_sg.id]}],
-    egress      = [{"from_port": 0,    "to_port": 0,    "protocol": "-1", "cidr_blocks": ["0.0.0.0/0"]}],
-    tags        = {**tags, "Name": f"{project}-db-sg"},
-)
-
 efs_sg = aws.ec2.SecurityGroup(
     f"{project}-efs-sg",
     vpc_id      = vpc.id,
-    description = "EFS mount",
+    description = "EFS mount targets",
     ingress     = [{"from_port": 2049, "to_port": 2049, "protocol": "tcp", "security_groups": [ecs_sg.id]}],
     egress      = [{"from_port": 0,    "to_port": 0,    "protocol": "-1", "cidr_blocks": ["0.0.0.0/0"]}],
     tags        = {**tags, "Name": f"{project}-efs-sg"},
 )
 
 # ─────────────────────────────────────────────
-# EFS  (persistent SonarQube data — survives container restarts)
+# EFS  — two access points: sonarqube data + postgres data
 # ─────────────────────────────────────────────
 efs = aws.efs.FileSystem(
     f"{project}-efs",
@@ -169,63 +151,32 @@ efs_mount_targets = [
     for i, priv in enumerate(private_subnets)
 ]
 
-efs_ap = aws.efs.AccessPoint(
-    f"{project}-efs-ap",
+# Access point for SonarQube app data (uid 1000 = sonarqube user in container)
+efs_ap_sonar = aws.efs.AccessPoint(
+    f"{project}-efs-ap-sonar",
     file_system_id = efs.id,
     posix_user     = {"uid": 1000, "gid": 1000},
     root_directory = {
         "path": "/sonarqube",
         "creation_info": {"owner_uid": 1000, "owner_gid": 1000, "permissions": "755"},
     },
-    tags = tags,
+    tags = {**tags, "Name": f"{project}-efs-ap-sonar"},
 )
 
-# ─────────────────────────────────────────────
-# RDS AURORA SERVERLESS V2  (auto-pause = ~$0 when idle)
-# ─────────────────────────────────────────────
-db_subnet_group = aws.rds.SubnetGroup(
-    f"{project}-db-sng",
-    subnet_ids  = [s.id for s in private_subnets],
-    description = f"{project} DB subnet group",
-    tags        = tags,
-)
-
-db_password = cfg.require_secret("dbPassword")
-
-db_cluster = aws.rds.Cluster(
-    f"{project}-db",
-    cluster_identifier      = f"{project}-{env}",
-    engine                  = "aurora-postgresql",
-    engine_mode             = "provisioned",
-    engine_version          = "16.4",
-    database_name           = "sonarqube",
-    master_username         = "sonarqube",
-    master_password         = db_password,
-    db_subnet_group_name    = db_subnet_group.name,
-    vpc_security_group_ids  = [db_sg.id],
-    serverlessv2_scaling_configuration = {
-        "min_capacity": 0.5,   # 0.5 ACU minimum — auto-pauses after 5 min idle
-        "max_capacity": 4.0,   # scales up to 4 ACU under load
+# Access point for PostgreSQL data (uid 999 = postgres user in official postgres image)
+efs_ap_pg = aws.efs.AccessPoint(
+    f"{project}-efs-ap-pg",
+    file_system_id = efs.id,
+    posix_user     = {"uid": 999, "gid": 999},
+    root_directory = {
+        "path": "/postgres",
+        "creation_info": {"owner_uid": 999, "owner_gid": 999, "permissions": "700"},
     },
-    skip_final_snapshot     = env != "prod",
-    deletion_protection     = env == "prod",
-    backup_retention_period = 7,
-    preferred_backup_window = "02:00-03:00",
-    storage_encrypted       = True,
-    tags                    = tags,
-)
-
-db_instance = aws.rds.ClusterInstance(
-    f"{project}-db-instance",
-    cluster_identifier = db_cluster.id,
-    instance_class     = "db.serverless",
-    engine             = db_cluster.engine,
-    engine_version     = db_cluster.engine_version,
-    tags               = tags,
+    tags = {**tags, "Name": f"{project}-efs-ap-pg"},
 )
 
 # ─────────────────────────────────────────────
-# ECR (optional: mirror sonarqube image for speed)
+# ECR
 # ─────────────────────────────────────────────
 ecr_repo = aws.ecr.Repository(
     f"{project}-ecr",
@@ -249,7 +200,7 @@ aws.ecr.LifecyclePolicy(
 )
 
 # ─────────────────────────────────────────────
-# IAM — ECS Task roles
+# IAM
 # ─────────────────────────────────────────────
 task_exec_role = aws.iam.Role(
     f"{project}-exec-role",
@@ -274,7 +225,6 @@ task_role = aws.iam.Role(
     tags = tags,
 )
 
-# Allow EFS access from task
 aws.iam.RolePolicy(
     f"{project}-task-efs-policy",
     role   = task_role.id,
@@ -288,7 +238,6 @@ aws.iam.RolePolicy(
     })),
 )
 
-# SSM Parameter Store for secrets
 aws.iam.RolePolicy(
     f"{project}-task-ssm-policy",
     role   = task_exec_role.id,
@@ -303,7 +252,7 @@ aws.iam.RolePolicy(
 )
 
 # ─────────────────────────────────────────────
-# SSM PARAMETERS  (GitOps: managed via config repo)
+# SSM — store DB password for container env injection
 # ─────────────────────────────────────────────
 db_pass_param = aws.ssm.Parameter(
     f"{project}-db-pass",
@@ -328,12 +277,11 @@ log_group = aws.cloudwatch.LogGroup(
 # ─────────────────────────────────────────────
 cluster = aws.ecs.Cluster(
     f"{project}-cluster",
-    name = f"{project}-{env}",
+    name     = f"{project}-{env}",
     settings = [{"name": "containerInsights", "value": "enabled"}],
     tags     = tags,
 )
 
-# Capacity providers: FARGATE_SPOT (cheapest) + FARGATE (fallback)
 aws.ecs.ClusterCapacityProviders(
     f"{project}-cp",
     cluster_name       = cluster.name,
@@ -346,72 +294,128 @@ aws.ecs.ClusterCapacityProviders(
 
 # ─────────────────────────────────────────────
 # TASK DEFINITION
-# SonarQube community: needs 2vCPU / 4GB min
+# Two containers in one task:
+#   1. postgres:16   — sidecar DB, data on EFS
+#   2. sonarqube:10  — connects to localhost:5432
+# Total: 2 vCPU / 6 GB  (postgres ~1GB + sonarqube ~4GB + headroom)
 # ─────────────────────────────────────────────
-sq_image = "sonarqube:10-community"  # pin to specific tag in production
-
 task_def = aws.ecs.TaskDefinition(
     f"{project}-task",
     family                   = f"{project}-{env}",
-    cpu                      = "2048",  # 2 vCPU
-    memory                   = "4096",  # 4 GB
+    cpu                      = "2048",   # 2 vCPU
+    memory                   = "6144",   # 6 GB (postgres 1GB + sonar 4GB + headroom)
     network_mode             = "awsvpc",
     requires_compatibilities = ["FARGATE"],
     execution_role_arn       = task_exec_role.arn,
     task_role_arn            = task_role.arn,
-    volumes = [{
-        "name": "sonarqube-data",
-        "efs_volume_configuration": {
-            "file_system_id":          efs.id,
-            "transit_encryption":      "ENABLED",
-            "authorization_config":    {
-                "access_point_id": efs_ap.id,
-                "iam":             "ENABLED",
+    volumes = [
+        {
+            "name": "sonarqube-data",
+            "efs_volume_configuration": {
+                "file_system_id":       efs.id,
+                "transit_encryption":   "ENABLED",
+                "authorization_config": {
+                    "access_point_id": efs_ap_sonar.id,
+                    "iam":             "ENABLED",
+                },
             },
         },
-    }],
+        {
+            "name": "postgres-data",
+            "efs_volume_configuration": {
+                "file_system_id":       efs.id,
+                "transit_encryption":   "ENABLED",
+                "authorization_config": {
+                    "access_point_id": efs_ap_pg.id,
+                    "iam":             "ENABLED",
+                },
+            },
+        },
+    ],
     container_definitions = pulumi.Output.all(
-        db_cluster.endpoint,
         db_pass_param.arn,
         log_group.name,
-    ).apply(lambda args: json.dumps([{
-        "name":      "sonarqube",
-        "image":     sq_image,
-        "essential": True,
-        "portMappings": [{"containerPort": 9000, "protocol": "tcp"}],
-        "environment": [
-            {"name": "SONAR_JDBC_URL",      "value": f"jdbc:postgresql://{args[0]}:5432/sonarqube"},
-            {"name": "SONAR_JDBC_USERNAME", "value": "sonarqube"},
-            {"name": "SONAR_WEB_PORT",      "value": "9000"},
-            # JVM tuning for Fargate
-            {"name": "SONAR_CE_JAVAOPTS",   "value": "-Xmx1g -Xms512m"},
-            {"name": "SONAR_WEB_JAVAOPTS",  "value": "-Xmx512m -Xms256m"},
-        ],
-        "secrets": [
-            {"name": "SONAR_JDBC_PASSWORD", "valueFrom": args[1]},
-        ],
-        "mountPoints": [{
-            "sourceVolume":  "sonarqube-data",
-            "containerPath": "/opt/sonarqube/data",
-            "readOnly":      False,
-        }],
-        "ulimits": [{"name": "nofile", "softLimit": 65535, "hardLimit": 65535}],
-        "logConfiguration": {
-            "logDriver": "awslogs",
-            "options": {
-                "awslogs-group":         args[2],
-                "awslogs-region":        region,
-                "awslogs-stream-prefix": "sonarqube",
+    ).apply(lambda args: json.dumps([
+        # ── Container 1: PostgreSQL sidecar ──────────────────────────
+        {
+            "name":      "postgres",
+            "image":     "postgres:16-alpine",
+            "essential": True,
+            "portMappings": [{"containerPort": 5432, "protocol": "tcp"}],
+            "environment": [
+                {"name": "POSTGRES_DB",       "value": "sonarqube"},
+                {"name": "POSTGRES_USER",     "value": "sonarqube"},
+                {"name": "PGDATA",            "value": "/var/lib/postgresql/data/pgdata"},
+            ],
+            "secrets": [
+                {"name": "POSTGRES_PASSWORD", "valueFrom": args[0]},
+            ],
+            "mountPoints": [{
+                "sourceVolume":  "postgres-data",
+                "containerPath": "/var/lib/postgresql/data",
+                "readOnly":      False,
+            }],
+            "healthCheck": {
+                "command":     ["CMD-SHELL", "pg_isready -U sonarqube -d sonarqube || exit 1"],
+                "interval":    10,
+                "timeout":     5,
+                "retries":     5,
+                "startPeriod": 30,
+            },
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group":         args[1],
+                    "awslogs-region":        region,
+                    "awslogs-stream-prefix": "postgres",
+                },
             },
         },
-        "healthCheck": {
-            "command":     ["CMD-SHELL", "wget -qO- http://localhost:9000/api/system/status | grep -q 'UP' || exit 1"],
-            "interval":    30,
-            "timeout":     5,
-            "retries":     5,
-            "startPeriod": 120,
+        # ── Container 2: SonarQube ───────────────────────────────────
+        {
+            "name":      "sonarqube",
+            "image":     "sonarqube:10-community",
+            "essential": True,
+            "portMappings": [{"containerPort": 9000, "protocol": "tcp"}],
+            # SonarQube connects to the postgres sidecar on localhost
+            "environment": [
+                {"name": "SONAR_JDBC_URL",      "value": "jdbc:postgresql://localhost:5432/sonarqube"},
+                {"name": "SONAR_JDBC_USERNAME", "value": "sonarqube"},
+                {"name": "SONAR_WEB_PORT",      "value": "9000"},
+                {"name": "SONAR_CE_JAVAOPTS",   "value": "-Xmx1g -Xms512m"},
+                {"name": "SONAR_WEB_JAVAOPTS",  "value": "-Xmx512m -Xms256m"},
+            ],
+            "secrets": [
+                {"name": "SONAR_JDBC_PASSWORD", "valueFrom": args[0]},
+            ],
+            "mountPoints": [{
+                "sourceVolume":  "sonarqube-data",
+                "containerPath": "/opt/sonarqube/data",
+                "readOnly":      False,
+            }],
+            # SonarQube must wait for postgres to be healthy before starting
+            "dependsOn": [{
+                "containerName": "postgres",
+                "condition":     "HEALTHY",
+            }],
+            "ulimits": [{"name": "nofile", "softLimit": 65535, "hardLimit": 65535}],
+            "healthCheck": {
+                "command":     ["CMD-SHELL", "wget -qO- http://localhost:9000/api/system/status | grep -q UP || exit 1"],
+                "interval":    30,
+                "timeout":     10,
+                "retries":     5,
+                "startPeriod": 180,
+            },
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group":         args[1],
+                    "awslogs-region":        region,
+                    "awslogs-stream-prefix": "sonarqube",
+                },
+            },
         },
-    }])),
+    ])),
     tags = tags,
 )
 
@@ -448,7 +452,7 @@ target_group = aws.lb.TargetGroup(
     tags                 = tags,
 )
 
-alb_listener = aws.lb.Listener(
+aws.lb.Listener(
     f"{project}-listener",
     load_balancer_arn = alb.arn,
     port              = 80,
@@ -457,14 +461,14 @@ alb_listener = aws.lb.Listener(
 )
 
 # ─────────────────────────────────────────────
-# ECS SERVICE  (desired_count=0 by default; scheduler turns it on)
+# ECS SERVICE  (desired_count=0 — scheduler starts it)
 # ─────────────────────────────────────────────
 service = aws.ecs.Service(
     f"{project}-service",
     name            = f"{project}-{env}",
     cluster         = cluster.id,
     task_definition = task_def.arn,
-    desired_count   = 0,   # ← ephemeral: off by default
+    desired_count   = 0,
     capacity_provider_strategies = [
         {"capacity_provider": "FARGATE_SPOT", "weight": 4, "base": 0},
         {"capacity_provider": "FARGATE",      "weight": 1, "base": 1},
@@ -479,19 +483,19 @@ service = aws.ecs.Service(
         "container_name":   "sonarqube",
         "container_port":   9000,
     }],
-    health_check_grace_period_seconds = 180,
-    deployment_circuit_breaker = {"enable": True, "rollback": True},
+    health_check_grace_period_seconds  = 300,
+    deployment_circuit_breaker         = {"enable": True, "rollback": True},
     deployment_maximum_percent         = 200,
-    deployment_minimum_healthy_percent = 0,   # allow 0 tasks (required for start/stop)
-    enable_execute_command = True,
-    tags                   = tags,
-    opts                   = pulumi.ResourceOptions(depends_on=efs_mount_targets),
+    deployment_minimum_healthy_percent = 0,
+    enable_execute_command             = True,
+    tags                               = tags,
+    opts                               = pulumi.ResourceOptions(depends_on=efs_mount_targets),
 )
 
 # ─────────────────────────────────────────────
-# APPLICATION AUTO SCALING (scale to 0 / 1)
+# APP AUTO SCALING
 # ─────────────────────────────────────────────
-aas_target = aws.appautoscaling.Target(
+aws.appautoscaling.Target(
     f"{project}-aas-target",
     max_capacity       = 1,
     min_capacity       = 0,
@@ -503,7 +507,7 @@ aas_target = aws.appautoscaling.Target(
 )
 
 # ─────────────────────────────────────────────
-# EVENTBRIDGE SCHEDULER  — Start/Stop on working hours
+# EVENTBRIDGE SCHEDULER — start/stop on working hours
 # ─────────────────────────────────────────────
 scheduler_role = aws.iam.Role(
     f"{project}-scheduler-role",
@@ -521,19 +525,16 @@ scheduler_role = aws.iam.Role(
 aws.iam.RolePolicy(
     f"{project}-scheduler-policy",
     role   = scheduler_role.id,
-    policy = pulumi.Output.all(service.id, cluster.arn).apply(lambda _: json.dumps({
+    policy = json.dumps({
         "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": ["ecs:UpdateService", "application-autoscaling:RegisterScalableTarget"],
-                "Resource": "*",
-            },
-        ],
-    })),
+        "Statement": [{
+            "Effect":   "Allow",
+            "Action":   ["ecs:UpdateService"],
+            "Resource": "*",
+        }],
+    }),
 )
 
-# START — weekdays at work_start UTC
 start_schedule = aws.scheduler.Schedule(
     f"{project}-start",
     name                         = f"{project}-{env}-start",
@@ -551,7 +552,6 @@ start_schedule = aws.scheduler.Schedule(
     },
 )
 
-# STOP — weekdays at work_end UTC
 stop_schedule = aws.scheduler.Schedule(
     f"{project}-stop",
     name                         = f"{project}-{env}-stop",
@@ -570,7 +570,7 @@ stop_schedule = aws.scheduler.Schedule(
 )
 
 # ─────────────────────────────────────────────
-# CLOUDWATCH ALARMS + SNS
+# CLOUDWATCH ALARMS
 # ─────────────────────────────────────────────
 alarm_topic = aws.sns.Topic(f"{project}-alarms", tags=tags)
 
@@ -592,14 +592,13 @@ aws.cloudwatch.MetricAlarm(
 # ─────────────────────────────────────────────
 # OUTPUTS
 # ─────────────────────────────────────────────
-pulumi.export("vpc_id",          vpc.id)
-pulumi.export("cluster_name",    cluster.name)
-pulumi.export("service_name",    service.name)
-pulumi.export("alb_dns",         alb.dns_name)
-pulumi.export("sonarqube_url",   alb.dns_name.apply(lambda d: f"http://{d}"))
-pulumi.export("db_endpoint",     db_cluster.endpoint)
-pulumi.export("efs_id",          efs.id)
-pulumi.export("ecr_repo",        ecr_repo.repository_url)
-pulumi.export("log_group",       log_group.name)
-pulumi.export("start_schedule",  f"cron(0 {work_start} ? * {work_days} *)")
-pulumi.export("stop_schedule",   f"cron(0 {work_end} ? * {work_days} *)")
+pulumi.export("vpc_id",         vpc.id)
+pulumi.export("cluster_name",   cluster.name)
+pulumi.export("service_name",   service.name)
+pulumi.export("alb_dns",        alb.dns_name)
+pulumi.export("sonarqube_url",  alb.dns_name.apply(lambda d: f"http://{d}"))
+pulumi.export("efs_id",         efs.id)
+pulumi.export("ecr_repo",       ecr_repo.repository_url)
+pulumi.export("log_group",      log_group.name)
+pulumi.export("start_schedule", f"cron(0 {work_start} ? * {work_days} *)")
+pulumi.export("stop_schedule",  f"cron(0 {work_end} ? * {work_days} *)")
