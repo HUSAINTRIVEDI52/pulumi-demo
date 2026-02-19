@@ -1,0 +1,13 @@
+# Pulumi.dev.yaml — development stack (cheapest settings)
+# To set the DB password run:
+#   cd infra && pulumi config set --secret sonarqube-ephemeral:dbPassword "YourP@ss!"
+
+config:
+  sonarqube-ephemeral:env:              "dev"
+  sonarqube-ephemeral:region:           "us-east-1"
+  sonarqube-ephemeral:workStartHourUTC: 7
+  sonarqube-ephemeral:workEndHourUTC:   19
+  sonarqube-ephemeral:workDays:         "MON-FRI"
+  sonarqube-ephemeral:computeTier:      "spot"
+  sonarqube-ephemeral:sonarEdition:     "community"
+  sonarqube-ephemeral:dbType:           "aurora-serverless"

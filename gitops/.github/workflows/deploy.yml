@@ -1,0 +1,178 @@
+name: SonarQube GitOps — Deploy
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "infra/**"
+      - "lambda/**"
+      - ".github/workflows/deploy.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "infra/**"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to perform"
+        required: true
+        type: choice
+        options: [preview, up, destroy, start, stop]
+      stack:
+        description: "Stack name (dev / prod)"
+        required: true
+        default: dev
+
+permissions:
+  id-token: write   # OIDC — no static AWS keys needed
+  contents: read
+  pull-requests: write
+
+env:
+  PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+  AWS_REGION: us-east-1
+
+jobs:
+  # ─────────────────────────────────────────
+  # PR: pulumi preview, posted as PR comment
+  # ─────────────────────────────────────────
+  preview:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: infra/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r infra/requirements.txt
+
+      - uses: pulumi/actions@v5
+        with:
+          command: preview
+          stack-name: dev
+          work-dir: infra
+          comment-on-pr: true
+          comment-on-summary-pr: true
+
+  # ─────────────────────────────────────────
+  # Push to main: pulumi up
+  # ─────────────────────────────────────────
+  deploy:
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'up')
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.stack || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: infra/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r infra/requirements.txt
+
+      - uses: pulumi/actions@v5
+        with:
+          command: up
+          stack-name: ${{ github.event.inputs.stack || 'dev' }}
+          work-dir: infra
+
+      - name: Summary
+        run: |
+          URL=$(pulumi stack output sonarqube_url -C infra -s ${{ github.event.inputs.stack || 'dev' }})
+          echo "## ✅ SonarQube Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** $URL" >> $GITHUB_STEP_SUMMARY
+          echo "**Stack:** ${{ github.event.inputs.stack || 'dev' }}" >> $GITHUB_STEP_SUMMARY
+
+  # ─────────────────────────────────────────
+  # Manual: start or stop the ECS service
+  # ─────────────────────────────────────────
+  toggle-service:
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      (github.event.inputs.action == 'start' || github.event.inputs.action == 'stop')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: infra/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r infra/requirements.txt
+
+      - name: Toggle ECS service
+        run: |
+          STACK="${{ github.event.inputs.stack }}"
+          ACTION="${{ github.event.inputs.action }}"
+          CLUSTER=$(pulumi stack output cluster_name -C infra -s $STACK)
+          SERVICE=$(pulumi stack output service_name -C infra -s $STACK)
+          COUNT=$([[ "$ACTION" == "start" ]] && echo 1 || echo 0)
+
+          echo "→ Setting $SERVICE desired_count=$COUNT"
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --desired-count $COUNT
+
+          ICON=$([[ "$ACTION" == "start" ]] && echo "▶️ Started" || echo "⏹️ Stopped")
+          echo "## $ICON SonarQube ($STACK)" >> $GITHUB_STEP_SUMMARY
+
+  # ─────────────────────────────────────────
+  # Manual: destroy (requires environment approval)
+  # ─────────────────────────────────────────
+  destroy:
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    environment: destroy-gate   # set this env to require manual approval in GitHub
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: infra/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r infra/requirements.txt
+
+      - uses: pulumi/actions@v5
+        with:
+          command: destroy
+          stack-name: ${{ github.event.inputs.stack }}
+          work-dir: infra

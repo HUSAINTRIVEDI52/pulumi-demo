@@ -1,0 +1,8 @@
+name: sonarqube-ephemeral
+runtime: python
+description: |
+  SonarQube ephemeral ECS Fargate Spot + Aurora Serverless v2.
+  Auto start/stop via EventBridge Scheduler. GitOps-ready.
+
+config:
+  aws:region: us-east-1
